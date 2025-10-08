@@ -809,6 +809,59 @@ class swu():
         # return     
         return result[0:64],result[64:128],XKEY        
         
+    def build_eap_aka_response(self, eap_identifier, res):
+        """
+        Build EAP-AKA Response payload with proper length calculation and padding.
+        
+        Args:
+            eap_identifier: EAP packet identifier
+            res: RES value (4-16 bytes according to 3GPP standard)
+            
+        Returns:
+            Complete EAP-AKA response payload with proper length and padding
+        """
+        # Validate RES length (must be 4-16 bytes according to 3GPP TS 33.102)
+        res_len = len(res)
+        if res_len < 4 or res_len > 16:
+            raise ValueError(f"RES length must be between 4-16 bytes, got {res_len}")
+        
+        # EAP-AKA fixed parts
+        eap_code = bytes([2])  # Response
+        eap_id = bytes([eap_identifier])
+        eap_aka_header = fromHex('1701000003030040')  # EAP-AKA Challenge Response header
+        eap_aka_header = fromHex('1701000003')  # EAP-AKA Challenge Response header
+        eap_res_bit_len = struct.pack('!H', res_len * 8)
+        at_mac_header = fromHex('0b050000')  # AT_MAC attribute header (16 bytes follow)
+        
+        # Calculate payload length before MAC
+        # Structure: Code(1) + ID(1) + Length(2) + EAP-AKA Header(8) + RES(var) + AT_MAC(20)
+        base_length = 1 + 1 + 2 + len(eap_aka_header) + 3 + res_len + len(at_mac_header) + 16
+        
+        # EAP-AKA payloads must be multiples of 4 bytes - add padding if needed
+        padding_needed = (4 - (base_length % 4)) % 4
+        eap_res_4bytes_len = struct.pack('!B', (res_len + padding_needed) // 4 + 1)
+        padding = bytes(padding_needed)
+        
+        # Final length including padding
+        total_length = base_length + padding_needed
+        
+        # Build length field (2 bytes, big endian)
+        length_bytes = struct.pack('!H', total_length)
+        
+        # Construct payload without MAC (MAC placeholder is 16 zero bytes)
+        eap_payload_response = (eap_code + 
+                              eap_id + 
+                              length_bytes + 
+                              eap_aka_header + 
+                              eap_res_4bytes_len + 
+                              eap_res_bit_len + 
+                              res + 
+                              padding +  # Add padding after RES if needed
+                              at_mac_header + 
+                              bytes(16))  # MAC placeholder
+        
+        return eap_payload_response
+        
 #######################################################################################################################
 #######################################################################################################################
 ################                            D E C O D E     F U N C T I O N S                          ################
@@ -2363,7 +2416,8 @@ class swu():
                                             print('MSK',toHex(self.MSK))
                                             print('EMSK',toHex(self.EMSK))
                                         
-                                            eap_payload_response = bytes([2]) + bytes([self.eap_identifier]) + fromHex('00281701000003030040') + self.RES + fromHex('0b050000' + 16*'00')
+                                            # Calculate dynamic EAP payload with proper padding
+                                            eap_payload_response = self.build_eap_aka_response(self.eap_identifier, self.RES)
                                         
                                             h = hmac.HMAC(self.KAUT,hashes.SHA1())
                                             h.update(eap_payload_response)
@@ -2555,7 +2609,8 @@ class swu():
                                     print('MSK',toHex(self.MSK))
                                     print('EMSK',toHex(self.EMSK))
                                     
-                                    eap_payload_response = bytes([2]) + bytes([self.eap_identifier]) + fromHex('00281701000003030040') + self.RES + fromHex('0b050000' + 16*'00')
+                                    # Calculate dynamic EAP payload with proper padding
+                                    eap_payload_response = self.build_eap_aka_response(self.eap_identifier, self.RES)
                                     
                                     h = hmac.HMAC(self.KAUT,hashes.SHA1())
                                     h.update(eap_payload_response)
