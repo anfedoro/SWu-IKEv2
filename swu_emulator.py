@@ -433,6 +433,8 @@ class swu():
         self.ike_spi_initiator_old = None
         self.ike_spi_responder_old = None
         self.next_reauth_id = None
+        self.ts_list_initiator_negotiated = []
+        self.ts_list_responder_negotiated = []
         
         self.check_nat = True
 
@@ -2807,6 +2809,10 @@ class swu():
                         print('IPSEC INIT SPI',toHex(self.spi_init_child))
                     else:
                         return MANDATORY_INFORMATION_MISSING,'MANDATORY_INFORMATION_MISSING'
+                elif i[0] == TSI:
+                    self.ts_list_initiator_negotiated = i[1][1]
+                elif i[0] == TSR:
+                    self.ts_list_responder_negotiated = i[1][1]
 
             self.generate_keying_material_child()
             return OK,''               

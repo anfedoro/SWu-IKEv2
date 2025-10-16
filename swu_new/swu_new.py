@@ -23,6 +23,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Optional, Sequence
+import ipaddress
 
 from swu_emulator import (
     AUTH_HMAC_MD5_96,
@@ -102,11 +103,14 @@ class SessionConfig:
 
     local_public_ip: str
     remote_public_ip: str
-    local_inner_ipv4: Optional[str]
-    remote_inner_ipv4: Optional[str]
+    local_inner_ipv4: Sequence[str]
+    local_inner_ipv6: Sequence[str]
     dns_servers_v4: Sequence[str]
+    dns_servers_v6: Sequence[str]
     child_sa: ChildSAParams
     userplane_mode: int
+    ts_local: Sequence[tuple]
+    ts_remote: Sequence[tuple]
 
 
 def _to_hex(data: bytes) -> str:
@@ -136,6 +140,8 @@ class ePDGIKEv2:
         ki: str,
         op: Optional[str] = None,
         opc: Optional[str] = None,
+        mcc: Optional[str] = None,
+        mnc: Optional[str] = None,
         default_gateway: Optional[str] = None,
         netns: Optional[str] = None,
     ) -> None:
@@ -147,12 +153,21 @@ class ePDGIKEv2:
         except OSError as exc:
             raise RuntimeError(f"Unable to resolve ePDG hostname '{epdg_address}': {exc}") from exc
 
-        if len(imsi) >= 6:
-            mcc = imsi[:3]
-            mnc = imsi[3:6]
-        else:
-            mcc = "001"
-            mnc = "01"
+        if mcc is None or mnc is None:
+            derived_mcc = imsi[:3] if len(imsi) >= 3 else "001"
+            remaining = imsi[3:] if len(imsi) > 3 else ""
+            if len(remaining) >= 3:
+                derived_mnc = remaining[:3]
+            elif len(remaining) >= 2:
+                derived_mnc = remaining[:2]
+            else:
+                derived_mnc = "01"
+            if mcc is None:
+                mcc = derived_mcc
+            if mnc is None:
+                mnc = derived_mnc
+        mcc = str(mcc)
+        mnc = str(mnc).zfill(3)
 
         # Instantiate the legacy helper but neutralise user-plane assumptions.
         self._ike = swu(
@@ -181,6 +196,8 @@ class ePDGIKEv2:
         self._running = False
         self._epdg_hostname = epdg_address
         self._epdg_ip = resolved_epdg
+        self._mcc = mcc
+        self._mnc = mnc
 
     # ------------------------------------------------------------------ helpers
 
@@ -351,16 +368,23 @@ class ePDGIKEv2:
             integ_key_in=ike.SK_IPSEC_AR,
         )
 
-        local_inner_ipv4 = ike.ip_address_list[0] if ike.ip_address_list else None
-        remote_inner_ipv4 = None  # most ePDG deployments avoid explicit tunnel peer
+        local_inner_ipv4 = list(ike.ip_address_list or [])
+        local_inner_ipv6 = list(getattr(ike, "ipv6_address_list", []) or [])
+        dns_v4 = list(ike.dns_address_list or [])
+        dns_v6 = list(getattr(ike, "dnsv6_address_list", []) or [])
+        ts_local = list(getattr(ike, "ts_list_initiator_negotiated", []) or [])
+        ts_remote = list(getattr(ike, "ts_list_responder_negotiated", []) or [])
         return SessionConfig(
             local_public_ip=ike.source_address,
             remote_public_ip=ike.epdg_address,
             local_inner_ipv4=local_inner_ipv4,
-            remote_inner_ipv4=remote_inner_ipv4,
-            dns_servers_v4=list(ike.dns_address_list),
+            local_inner_ipv6=local_inner_ipv6,
+            dns_servers_v4=dns_v4,
+            dns_servers_v6=dns_v6,
             child_sa=child,
             userplane_mode=ike.userplane_mode,
+            ts_local=ts_local,
+            ts_remote=ts_remote,
         )
 
     # ----------------------------------------------------------------- public API
@@ -478,6 +502,71 @@ class ePDGIPSec:
         logger.debug("Running command: %s", " ".join(command))
         subprocess.run(command, check=True)  # nosec B603
 
+    @staticmethod
+    def _range_to_network(start: str, end: str) -> Optional[ipaddress._BaseNetwork]:
+        start_ip = ipaddress.ip_address(start)
+        end_ip = ipaddress.ip_address(end)
+        if start_ip.version != end_ip.version:
+            return None
+        bits = start_ip.max_prefixlen
+        diff = int(start_ip) ^ int(end_ip)
+        prefix = bits - diff.bit_length()
+        if prefix < 0:
+            prefix = 0
+        return ipaddress.ip_network(f"{start}/{prefix}", strict=False)
+
+    def _ts_prefixes(self, ts_list: Sequence[tuple], family: int) -> list[str]:
+        prefixes: list[str] = []
+        for ts in ts_list or []:
+            ts_type = ts[0]
+            if family == 4 and ts_type != TS_IPV4_ADDR_RANGE:
+                continue
+            if family == 6 and ts_type != TS_IPV6_ADDR_RANGE:
+                continue
+            network = self._range_to_network(ts[4], ts[5])
+            if network:
+                prefixes.append(str(network))
+        return list(dict.fromkeys(prefixes))
+
+    def _match_prefix(self, address: str, ts_list: Sequence[tuple]) -> Optional[int]:
+        ip = ipaddress.ip_address(address)
+        for ts in ts_list or []:
+            network = self._range_to_network(ts[4], ts[5])
+            if network and ip.version == network.version and ip in network:
+                return network.prefixlen
+        return None
+
+    def _policy_specs(self, session: SessionConfig) -> list[tuple[str, str, str, list[str]]]:
+        specs: list[tuple[str, str, str, list[str]]] = []
+        tmpl_out = ["tmpl", "src", session.local_public_ip, "dst", session.remote_public_ip, "proto", "esp", "mode", "tunnel"]
+        tmpl_in = ["tmpl", "src", session.remote_public_ip, "dst", session.local_public_ip, "proto", "esp", "mode", "tunnel"]
+
+        if session.local_inner_ipv4:
+            v4_dsts = self._ts_prefixes(session.ts_remote, 4) or ["0.0.0.0/0"]
+            v4_srcs = []
+            for addr in session.local_inner_ipv4:
+                prefix = self._match_prefix(addr, session.ts_local) or 32
+                v4_srcs.append(f"{addr}/{prefix}")
+            for src in dict.fromkeys(v4_srcs):
+                for dst in v4_dsts:
+                    specs.append(("out", src, dst, tmpl_out))
+                    specs.append(("in", dst, src, tmpl_in))
+                    specs.append(("fwd", dst, src, tmpl_in))
+
+        if session.local_inner_ipv6:
+            v6_dsts = self._ts_prefixes(session.ts_remote, 6) or ["::/0"]
+            v6_srcs = []
+            for addr in session.local_inner_ipv6:
+                prefix = self._match_prefix(addr, session.ts_local) or 128
+                v6_srcs.append(f"{addr}/{prefix}")
+            for src in dict.fromkeys(v6_srcs):
+                for dst in v6_dsts:
+                    specs.append(("out", src, dst, tmpl_out))
+                    specs.append(("in", dst, src, tmpl_in))
+                    specs.append(("fwd", dst, src, tmpl_in))
+
+        return specs
+
     def _install_states(self, session: SessionConfig) -> None:
         child = session.child_sa
 
@@ -509,11 +598,9 @@ class ePDGIPSec:
                 "auth",
                 auth_name,
                 _to_hex(child.integ_key_out),
-                str(auth_trunc),
                 "enc",
                 enc_name,
                 _to_hex(child.encr_key_out),
-                str(len(child.encr_key_out) * 8),
             ]
             inbound_cmd = [
                 "ip",
@@ -533,11 +620,9 @@ class ePDGIPSec:
                 "auth",
                 auth_name,
                 _to_hex(child.integ_key_in),
-                str(auth_trunc),
                 "enc",
                 enc_name,
                 _to_hex(child.encr_key_in),
-                str(len(child.encr_key_in) * 8),
             ]
         else:  # AEAD (GCM)
             if child.integ_alg not in (NONE,):
@@ -592,27 +677,8 @@ class ePDGIPSec:
         self._run(inbound_cmd)
 
     def _install_policies(self, session: SessionConfig) -> None:
-        inner = session.local_inner_ipv4 or "0.0.0.0/0"
-
-        templates = [
-            (
-                ["dir", "out", "src", inner, "dst", "0.0.0.0/0"],
-                ["tmpl", "src", session.local_public_ip, "dst", session.remote_public_ip, "proto", "esp", "mode", "tunnel"],
-            ),
-            (
-                ["dir", "in", "src", "0.0.0.0/0", "dst", inner],
-                ["tmpl", "src", session.remote_public_ip, "dst", session.local_public_ip, "proto", "esp", "mode", "tunnel"],
-            ),
-            (
-                ["dir", "fwd", "src", "0.0.0.0/0", "dst", inner],
-                ["tmpl", "src", session.remote_public_ip, "dst", session.local_public_ip, "proto", "esp", "mode", "tunnel"],
-            ),
-        ]
-
-        for attrs, tmpl in templates:
-            self._run(
-                ["ip", "xfrm", "policy", "add", *attrs, *tmpl],
-            )
+        for direction, src, dst, tmpl in self._policy_specs(session):
+            self._run(["ip", "xfrm", "policy", "add", "src", src, "dst", dst, "dir", direction, "priority", "2342", *tmpl])
 
     # ----------------------------------------------------------------- public API
 
@@ -623,30 +689,80 @@ class ePDGIPSec:
         self._session = session
 
         logger.info("Creating VTI interface %s", self.interface)
-        self._run(
-            [
-                "ip",
-                "link",
-                "add",
-                self.interface,
-                "type",
-                "vti",
-                "local",
-                session.local_public_ip,
-                "remote",
-                session.remote_public_ip,
-                "ikey",
-                str(session.child_sa.spi_out),
-                "okey",
-                str(session.child_sa.spi_in),
-            ]
-        )
+        try:
+            self._run(
+                [
+                    "ip",
+                    "link",
+                    "add",
+                    self.interface,
+                    "type",
+                    "vti",
+                    "local",
+                    session.local_public_ip,
+                    "remote",
+                    session.remote_public_ip,
+                    "ikey",
+                    str(session.child_sa.spi_out),
+                    "okey",
+                    str(session.child_sa.spi_in),
+                ]
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode() if exc.stderr else ""
+            if "File exists" in stderr:
+                logger.info("Interface %s already exists – reusing", self.interface)
+            elif "Operation not permitted" in stderr:
+                logger.warning("Insufficient privileges to create VTI interface. Proceeding without dataplane configuration.")
+                return
+            else:
+                raise
         self._run(["ip", "link", "set", self.interface, "up"])
 
         if session.local_inner_ipv4:
-            self._run(["ip", "addr", "add", f"{session.local_inner_ipv4}/32", "dev", self.interface])
-            self._run(["ip", "route", "add", "0.0.0.0/1", "dev", self.interface])
-            self._run(["ip", "route", "add", "128.0.0.0/1", "dev", self.interface])
+            for addr in session.local_inner_ipv4:
+                prefix = self._match_prefix(addr, session.ts_local) or 32
+                try:
+                    self._run(["ip", "addr", "add", f"{addr}/{prefix}", "dev", self.interface])
+                except subprocess.CalledProcessError as exc:
+                    stderr = exc.stderr.decode() if exc.stderr else ""
+                    if "File exists" not in stderr:
+                        raise
+            for route in ("0.0.0.0/1", "128.0.0.0/1"):
+                try:
+                    self._run(["ip", "route", "add", route, "dev", self.interface])
+                except subprocess.CalledProcessError as exc:
+                    stderr = exc.stderr.decode() if exc.stderr else ""
+                    if "File exists" not in stderr:
+                        raise
+
+        if session.local_inner_ipv6:
+            for addr in session.local_inner_ipv6:
+                prefix = self._match_prefix(addr, session.ts_local) or 128
+                try:
+                    self._run(["ip", "-6", "addr", "add", f"{addr}/{prefix}", "dev", self.interface])
+                except subprocess.CalledProcessError as exc:
+                    stderr = exc.stderr.decode() if exc.stderr else ""
+                    if "File exists" not in stderr:
+                        raise
+            v6_dsts = self._ts_prefixes(session.ts_remote, 6) or ["::/0"]
+            routes: list[str] = []
+            for dst in v6_dsts:
+                if dst == "::/0":
+                    routes.extend(["::/1", "8000::/1"])
+                else:
+                    routes.append(dst)
+            seen_routes: set[str] = set()
+            for route in routes:
+                if route in seen_routes:
+                    continue
+                seen_routes.add(route)
+                try:
+                    self._run(["ip", "-6", "route", "add", route, "dev", self.interface])
+                except subprocess.CalledProcessError as exc:
+                    stderr = exc.stderr.decode() if exc.stderr else ""
+                    if "File exists" not in stderr:
+                        raise
 
         self._install_states(session)
         self._install_policies(session)
@@ -691,69 +807,8 @@ class ePDGIPSec:
                 ],
             ]
             delete_policy_cmds = [
-                [
-                    "ip",
-                    "xfrm",
-                    "policy",
-                    "delete",
-                    "dir",
-                    "out",
-                    "src",
-                    session.local_inner_ipv4 or "0.0.0.0/0",
-                    "dst",
-                    "0.0.0.0/0",
-                    "tmpl",
-                    "src",
-                    session.local_public_ip,
-                    "dst",
-                    session.remote_public_ip,
-                    "proto",
-                    "esp",
-                    "mode",
-                    "tunnel",
-                ],
-                [
-                    "ip",
-                    "xfrm",
-                    "policy",
-                    "delete",
-                    "dir",
-                    "in",
-                    "src",
-                    "0.0.0.0/0",
-                    "dst",
-                    session.local_inner_ipv4 or "0.0.0.0/0",
-                    "tmpl",
-                    "src",
-                    session.remote_public_ip,
-                    "dst",
-                    session.local_public_ip,
-                    "proto",
-                    "esp",
-                    "mode",
-                    "tunnel",
-                ],
-                [
-                    "ip",
-                    "xfrm",
-                    "policy",
-                    "delete",
-                    "dir",
-                    "fwd",
-                    "src",
-                    "0.0.0.0/0",
-                    "dst",
-                    session.local_inner_ipv4 or "0.0.0.0/0",
-                    "tmpl",
-                    "src",
-                    session.remote_public_ip,
-                    "dst",
-                    session.local_public_ip,
-                    "proto",
-                    "esp",
-                    "mode",
-                    "tunnel",
-                ],
+                ["ip", "xfrm", "policy", "delete", "src", src, "dst", dst, "dir", direction]
+                for direction, src, dst, _ in self._policy_specs(session)
             ]
             for cmd in delete_state_cmds + delete_policy_cmds:
                 try:
@@ -770,6 +825,10 @@ class ePDGIPSec:
             self._run(["ip", "link", "del", self.interface])
         except subprocess.CalledProcessError as exc:
             logger.debug("Failed to delete VTI interface (ignored): %s", exc)
+        try:
+            self._run(["ip", "link", "del", f"ip_{self.interface}"])
+        except subprocess.CalledProcessError:
+            pass
 
         self.active = False
         self._session = None
@@ -795,6 +854,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--ki", required=True, help="MilenaGE Ki value (hex)")
     parser.add_argument("--op", help="MilenaGE OP value (hex)")
     parser.add_argument("--opc", help="MilenaGE OPC value (hex)")
+    parser.add_argument("--mcc", help="Override MCC (three digits)")
+    parser.add_argument("--mnc", help="Override MNC (two or three digits)")
     parser.add_argument("--interface", default="vti0", help="VTI interface name")
 
     args = parser.parse_args(argv)
@@ -808,6 +869,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         ki=args.ki,
         op=args.op,
         opc=args.opc,
+        mcc=args.mcc,
+        mnc=args.mnc,
     )
     session = ike.connect()
 
