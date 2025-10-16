@@ -336,6 +336,7 @@ EAP_FAILURE  = 4
 
 #IANA EAP Type
 EAP_AKA = 23
+EAP_IDENTITY = 1
 
 #EAP-AKA/EAP-SIM Subtypes:
 AKA_Challenge = 1
@@ -401,6 +402,7 @@ class swu():
         
         self.netns_name = netns
         self.sqn = sqn
+        self.eap_payload_response = b''
         
         self.set_variables()
         self.set_udp() # default
@@ -437,6 +439,7 @@ class swu():
         self.set_identification(IDI,ID_RFC822_ADDR,'0' + self.imsi + '@nai.epc.mnc' + self.mnc + '.mcc' + self.mcc + '.3gppnetwork.org')
 #       self.set_identification(IDR,ID_FQDN, self.apn + '.apn.epc.mnc' + self.mnc + '.mcc' + self.mcc + '.3gppnetwork.org')
         self.set_identification(IDR,ID_FQDN, self.apn)
+        self.permanent_identity = self.apn
         
         self.ike_decoded_header = {}
         self.decodable_payloads = [
@@ -2101,25 +2104,59 @@ class swu():
         return packet
 
     def create_IKE_AUTH(self):
-        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, IDI, 2, 0, IKE_AUTH, (0,0,1), self.message_id_request)
-        payload = self.encode_generic_payload_header(IDR,0,self.encode_payload_type_idi())
-        payload += self.encode_generic_payload_header(CP,0,self.encode_payload_type_idr())        
-        payload += self.encode_generic_payload_header(SA,0,self.encode_payload_type_cp())   
-        payload += self.encode_generic_payload_header(TSI,0,self.encode_payload_type_sa(self.sa_list_child))         
-        payload += self.encode_generic_payload_header(TSR,0,self.encode_payload_type_tsi())          
-        payload += self.encode_generic_payload_header(N,0,self.encode_payload_type_tsr()) 
-        payload += self.encode_generic_payload_header(NONE,0,self.encode_payload_type_n(RESERVED,b'',EAP_ONLY_AUTHENTICATION))                
-        packet = self.set_ike_packet_length(header+payload)        
-        
-        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)     
+        header = self.encode_header(
+            self.ike_spi_initiator,
+            self.ike_spi_responder,
+            IDI,
+            2,
+            0,
+            IKE_AUTH,
+            (0, 0, 1),
+            self.message_id_request,
+        )
+        payload = self.encode_generic_payload_header(
+            IDR, 0, self.encode_payload_type_idi()
+        )
+        payload += self.encode_generic_payload_header(
+            CP, 0, self.encode_payload_type_idr()
+        )
+        payload += self.encode_generic_payload_header(
+            SA, 0, self.encode_payload_type_cp()
+        )
+        payload += self.encode_generic_payload_header(
+            TSI, 0, self.encode_payload_type_sa(self.sa_list_child)
+        )
+        payload += self.encode_generic_payload_header(
+            TSR, 0, self.encode_payload_type_tsi()
+        )
+        payload += self.encode_generic_payload_header(
+            NONE, 0, self.encode_payload_type_tsr()
+        )
+        payload += self.encode_generic_payload_header(
+            NONE, 0, self.encode_payload_type_n(RESERVED, b"", EAP_ONLY_AUTHENTICATION)
+        )
+        packet = self.set_ike_packet_length(header + payload)
+
+        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
         return encrypted_and_integrity_packet
 
     def create_IKE_AUTH_EAP_IDENTITY(self):
-        header = self.encode_header(self.ike_spi_initiator, self.ike_spi_responder, EAP, 2, 0, IKE_AUTH, (0,0,1), self.message_id_request)        
-        payload = self.encode_generic_payload_header(NONE,0,self.encode_payload_type_eap())        
-        packet = self.set_ike_packet_length(header+payload)        
-        
-        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)                       
+        header = self.encode_header(
+            self.ike_spi_initiator,
+            self.ike_spi_responder,
+            EAP,
+            2,
+            0,
+            IKE_AUTH,
+            (0, 0, 1),
+            self.message_id_request,
+        )
+        payload = self.encode_generic_payload_header(
+            NONE, 0, self.encode_payload_type_eap()
+        )
+        packet = self.set_ike_packet_length(header + payload)
+
+        encrypted_and_integrity_packet = self.encode_payload_type_sk(packet)
         return encrypted_and_integrity_packet
 
 
@@ -2364,7 +2401,30 @@ class swu():
                     elif i[1][1]<16384: #error
                         return OTHER_ERROR,str(i[1][1])
                 elif i[0] == EAP:
-   
+
+                    if i[1][0] in (EAP_REQUEST,) and i[1][2] in (EAP_IDENTITY,):
+                        eap_received = True
+                        self.eap_identifier = i[1][1]
+                        identity = (
+                            '0'
+                            + self.imsi
+                            + '@nai.epc.mnc' + self.mnc
+                            + '.mcc' + self.mcc
+                            + '.3gppnetwork.org'
+                        )
+                        self.eap_payload_response = (
+                            bytes([EAP_RESPONSE])
+                            + bytes([self.eap_identifier])
+                            + fromHex('004417050000')
+                            + self.encode_eap_at_identity(identity)
+                        )
+                        eap = bytearray(self.eap_payload_response)
+                        eap_length = struct.pack('>H', len(eap))
+                        eap[2] = eap_length[0]
+                        eap[3] = eap_length[1]
+                        self.eap_payload_response = bytes(eap)
+                        return REPEAT_STATE,'EAP IDENTITY'
+
                     if i[1][0] in (EAP_REQUEST,) and i[1][2] in (EAP_AKA,):
                         if i[1][3] in (AKA_Challenge, AKA_Reauthentication):
                             
@@ -2562,6 +2622,28 @@ class swu():
                         
                 elif i[0] == EAP:
                     eap_received = True
+                    if i[1][0] == EAP_REQUEST and i[1][2] == EAP_IDENTITY:
+                        eap_received = True
+                        self.eap_identifier = i[1][1]
+                        identity = (
+                            '0'
+                            + self.imsi
+                            + '@nai.epc.mnc' + self.mnc
+                            + '.mcc' + self.mcc
+                            + '.3gppnetwork.org'
+                        )
+                        self.eap_payload_response = (
+                            bytes([EAP_RESPONSE])
+                            + bytes([self.eap_identifier])
+                            + fromHex('004417050000')
+                            + self.encode_eap_at_identity(identity)
+                        )
+                        eap = bytearray(self.eap_payload_response)
+                        eap_length = struct.pack('>H', len(eap))
+                        eap[2] = eap_length[0]
+                        eap[3] = eap_length[1]
+                        self.eap_payload_response = bytes(eap)
+                        return REPEAT_STATE, 'EAP IDENTITY'
                     if i[1][0] in (EAP_SUCCESS,):
                     
                         hash = self.prf_function.get(self.negotiated_prf) 
