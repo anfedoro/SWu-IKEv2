@@ -24,6 +24,7 @@ import sys
 from dataclasses import dataclass
 from typing import Optional, Sequence
 import ipaddress
+from socket import AF_INET, AF_UNSPEC, SOCK_DGRAM, gaierror, getaddrinfo
 
 from swu_emulator import (
     AUTH_HMAC_MD5_96,
@@ -53,7 +54,7 @@ from swu_emulator import (
     P_CSCF_IP6_ADDRESS,
     INFORMATIONAL,
     KEY_LENGTH,
-    MODP_1024_bit,
+    #    MODP_1024_bit,
     MODP_2048_bit,
     NONE,
     NAT_TRAVERSAL,
@@ -121,6 +122,30 @@ def _spi_bytes_to_int(spi: bytes) -> int:
     return int.from_bytes(spi, byteorder="big", signed=False)
 
 
+def _resolve_epdg_address(hostname: str) -> str:
+    """
+    Resolve the ePDG FQDN to an IPv4 address using the system resolver.
+
+    Prefer IPv4 addresses (AF_INET); fall back to whatever the resolver returns.
+    """
+
+    def _query(family: int) -> list[tuple]:
+        try:
+            return getaddrinfo(hostname, None, family, SOCK_DGRAM)
+        except gaierror:
+            return []
+
+    candidates = _query(AF_INET) or _query(AF_UNSPEC)
+    if not candidates:
+        raise RuntimeError(f"Unable to resolve ePDG hostname '{hostname}' via system resolver")
+    # getaddrinfo returns tuples: (family, type, proto, canonname, sockaddr)
+    for family, _type, _proto, _canon, sockaddr in candidates:
+        if family == AF_INET:
+            return sockaddr[0]
+    # fallback – return the first address as a string
+    return candidates[0][4][0]
+
+
 class ePDGIKEv2:
     """
     Thin wrapper around :class:`swu_emulator.swu` that exposes a friendlier API.
@@ -148,10 +173,7 @@ class ePDGIKEv2:
         if not (op or opc):
             raise ValueError("Either OP or OPC must be provided for Milenage.")
 
-        try:
-            resolved_epdg = socket.gethostbyname(epdg_address)
-        except OSError as exc:
-            raise RuntimeError(f"Unable to resolve ePDG hostname '{epdg_address}': {exc}") from exc
+        resolved_epdg = _resolve_epdg_address(epdg_address)
 
         if mcc is None or mnc is None:
             derived_mcc = imsi[:3] if len(imsi) >= 3 else "001"
@@ -204,13 +226,13 @@ class ePDGIKEv2:
     @staticmethod
     def _default_sa_list() -> list:
         return [
-            [
-                [IKE, 0],
-                [ENCR, ENCR_NULL],
-                [PRF, PRF_HMAC_SHA1],
-                [INTEG, AUTH_HMAC_SHA1_96],
-                [D_H, MODP_1024_bit],
-            ],
+            # [
+            #     [IKE, 0],
+            #     [ENCR, ENCR_NULL],
+            #     [PRF, PRF_HMAC_SHA1],
+            #     [INTEG, AUTH_HMAC_SHA1_96],
+            #     [D_H, MODP_1024_bit],
+            # ],
             [
                 [IKE, 0],
                 [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 128]],
@@ -218,13 +240,13 @@ class ePDGIKEv2:
                 [INTEG, AUTH_HMAC_SHA1_96],
                 [D_H, MODP_2048_bit],
             ],
-            [
-                [IKE, 0],
-                [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 128]],
-                [PRF, PRF_HMAC_SHA1],
-                [INTEG, AUTH_HMAC_SHA1_96],
-                [D_H, MODP_1024_bit],
-            ],
+            # [
+            #     [IKE, 0],
+            #     [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 128]],
+            #     [PRF, PRF_HMAC_SHA1],
+            #     [INTEG, AUTH_HMAC_SHA1_96],
+            #     [D_H, MODP_1024_bit],
+            # ],
         ]
 
     @staticmethod
@@ -277,14 +299,14 @@ class ePDGIKEv2:
     @staticmethod
     def _default_ts_initiator() -> list:
         return [
-            [TS_IPV4_ADDR_RANGE, ANY, 0, 65535, "0.0.0.0", "255.255.255.255"],
+            # [TS_IPV4_ADDR_RANGE, ANY, 0, 65535, "0.0.0.0", "255.255.255.255"],
             [TS_IPV6_ADDR_RANGE, ANY, 0, 65535, "::", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"],
         ]
 
     @staticmethod
     def _default_ts_responder() -> list:
         return [
-            [TS_IPV4_ADDR_RANGE, ANY, 0, 65535, "0.0.0.0", "255.255.255.255"],
+            # [TS_IPV4_ADDR_RANGE, ANY, 0, 65535, "0.0.0.0", "255.255.255.255"],
             [TS_IPV6_ADDR_RANGE, ANY, 0, 65535, "::", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"],
         ]
 
@@ -292,11 +314,11 @@ class ePDGIKEv2:
     def _default_cp_list() -> list:
         return [
             CFG_REQUEST,
-            [INTERNAL_IP4_ADDRESS],
-            [INTERNAL_IP4_DNS],
+            # [INTERNAL_IP4_ADDRESS],
+            # [INTERNAL_IP4_DNS],
             [INTERNAL_IP6_ADDRESS],
             [INTERNAL_IP6_DNS],
-            [P_CSCF_IP4_ADDRESS],
+            # [P_CSCF_IP4_ADDRESS],
             [P_CSCF_IP6_ADDRESS],
         ]
 
@@ -538,8 +560,33 @@ class ePDGIPSec:
 
     def _policy_specs(self, session: SessionConfig) -> list[tuple[str, str, str, list[str]]]:
         specs: list[tuple[str, str, str, list[str]]] = []
-        tmpl_out = ["tmpl", "src", session.local_public_ip, "dst", session.remote_public_ip, "proto", "esp", "mode", "tunnel"]
-        tmpl_in = ["tmpl", "src", session.remote_public_ip, "dst", session.local_public_ip, "proto", "esp", "mode", "tunnel"]
+        reqid = session.child_sa.spi_out & 0xFFFFFFFF
+        tmpl_out = [
+            "tmpl",
+            "src",
+            session.local_public_ip,
+            "dst",
+            session.remote_public_ip,
+            "proto",
+            "esp",
+            "reqid",
+            str(reqid),
+            "mode",
+            "tunnel",
+        ]
+        tmpl_in = [
+            "tmpl",
+            "src",
+            session.remote_public_ip,
+            "dst",
+            session.local_public_ip,
+            "proto",
+            "esp",
+            "reqid",
+            str(reqid),
+            "mode",
+            "tunnel",
+        ]
 
         if session.local_inner_ipv4:
             v4_dsts = self._ts_prefixes(session.ts_remote, 4) or ["0.0.0.0/0"]
@@ -569,6 +616,7 @@ class ePDGIPSec:
 
     def _install_states(self, session: SessionConfig) -> None:
         child = session.child_sa
+        reqid = child.spi_out & 0xFFFFFFFF
 
         if child.encr_alg not in self.ENCR_ALG_MAP:
             raise ValueError(f"Encryption algorithm {child.encr_alg} is not supported yet.")
@@ -579,6 +627,12 @@ class ePDGIPSec:
                 raise ValueError(f"Integrity algorithm {child.integ_alg} is not supported yet.")
             auth_name, auth_trunc = self.AUTH_ALG_MAP[child.integ_alg]
             enc_name = enc_type[1]
+
+            auth_args_out = ["auth", auth_name, _to_hex(child.integ_key_out)]
+            auth_args_in = ["auth", auth_name, _to_hex(child.integ_key_in)]
+            if auth_trunc:
+                auth_args_out = ["auth-trunc", auth_name, _to_hex(child.integ_key_out), str(auth_trunc)]
+                auth_args_in = ["auth-trunc", auth_name, _to_hex(child.integ_key_in), str(auth_trunc)]
 
             outbound_cmd = [
                 "ip",
@@ -595,9 +649,9 @@ class ePDGIPSec:
                 f"{child.spi_out:#010x}",
                 "mode",
                 "tunnel",
-                "auth",
-                auth_name,
-                _to_hex(child.integ_key_out),
+                "reqid",
+                str(reqid),
+                *auth_args_out,
                 "enc",
                 enc_name,
                 _to_hex(child.encr_key_out),
@@ -617,9 +671,9 @@ class ePDGIPSec:
                 f"{child.spi_in:#010x}",
                 "mode",
                 "tunnel",
-                "auth",
-                auth_name,
-                _to_hex(child.integ_key_in),
+                "reqid",
+                str(reqid),
+                *auth_args_in,
                 "enc",
                 enc_name,
                 _to_hex(child.encr_key_in),
@@ -645,6 +699,8 @@ class ePDGIPSec:
                 f"{child.spi_out:#010x}",
                 "mode",
                 "tunnel",
+                "reqid",
+                str(reqid),
                 "aead",
                 aead_name,
                 _to_hex(child.encr_key_out),
@@ -666,6 +722,8 @@ class ePDGIPSec:
                 f"{child.spi_in:#010x}",
                 "mode",
                 "tunnel",
+                "reqid",
+                str(reqid),
                 "aead",
                 aead_name,
                 _to_hex(child.encr_key_in),
@@ -673,12 +731,20 @@ class ePDGIPSec:
                 str(key_bits),
             ]
 
+        if session.userplane_mode == NAT_TRAVERSAL:
+            outbound_cmd.extend(["encap", "espinudp", "4500", "4500", session.remote_public_ip])
+            inbound_cmd.extend(["encap", "espinudp", "4500", "4500", session.local_public_ip])
+
+        logger.info("IPXFRM state add (outbound): %s", " ".join(outbound_cmd))
         self._run(outbound_cmd)
+        logger.info("IPXFRM state add (inbound): %s", " ".join(inbound_cmd))
         self._run(inbound_cmd)
 
     def _install_policies(self, session: SessionConfig) -> None:
         for direction, src, dst, tmpl in self._policy_specs(session):
-            self._run(["ip", "xfrm", "policy", "add", "src", src, "dst", dst, "dir", direction, "priority", "2342", *tmpl])
+            cmd = ["ip", "xfrm", "policy", "add", "src", src, "dst", dst, "dir", direction, "priority", "2342", *tmpl]
+            logger.info("IPXFRM policy add (%s): %s", direction, " ".join(cmd))
+            self._run(cmd)
 
     # ----------------------------------------------------------------- public API
 
@@ -806,10 +872,7 @@ class ePDGIPSec:
                     f"{child.spi_in:#010x}",
                 ],
             ]
-            delete_policy_cmds = [
-                ["ip", "xfrm", "policy", "delete", "src", src, "dst", dst, "dir", direction]
-                for direction, src, dst, _ in self._policy_specs(session)
-            ]
+            delete_policy_cmds = [["ip", "xfrm", "policy", "delete", "src", src, "dst", dst, "dir", direction] for direction, src, dst, _ in self._policy_specs(session)]
             for cmd in delete_state_cmds + delete_policy_cmds:
                 try:
                     self._run(cmd)
